@@ -2,39 +2,100 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
+	"net/http"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/autoscaling/autoscalingiface"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
+	yaml "gopkg.in/yaml.v2"
 )
 
-// AWSClient allows you to get the list of IP addresses of instanes of an Auto Scaling group
+// AWSClient allows you to get the list of IP addresses of instanes of an Auto Scaling group. It implements the CloudProvider interface
 type AWSClient struct {
 	svcEC2         ec2iface.EC2API
 	svcAutoscaling autoscalingiface.AutoScalingAPI
+	config         *awsConfig
 }
 
 // NewAWSClient creates an AWSClient
-func NewAWSClient(svcEC2 ec2iface.EC2API, svcAutoscaling autoscalingiface.AutoScalingAPI) *AWSClient {
-	return &AWSClient{svcEC2, svcAutoscaling}
+func NewAWSClient() *AWSClient {
+	return &AWSClient{}
 }
 
-// CheckIfAutoscalingGroupExists checks if the Auto Scaling group exists
-func (client *AWSClient) CheckIfAutoscalingGroupExists(name string) (bool, error) {
+// Configure configures the AWSClient with necessary parameters
+func (client *AWSClient) Configure() error {
+	httpClient := &http.Client{Timeout: connTimeoutInSecs * time.Second}
+	cfg := &aws.Config{Region: aws.String(client.config.Region), HTTPClient: httpClient}
+
+	session, err := session.NewSession(cfg)
+	if err != nil {
+		return err
+	}
+
+	svcAutoscaling := autoscaling.New(session)
+	svcEC2 := ec2.New(session)
+	client.svcEC2 = svcEC2
+	client.svcAutoscaling = svcAutoscaling
+	return nil
+}
+
+// ValidateAndSaveConfig parses and validates AWSClient config and saves it
+func (client *AWSClient) ValidateAndSaveConfig(configPath string) error {
+	data, err := ioutil.ReadFile(*configFile)
+	if err != nil {
+		return err
+	}
+
+	cfg := &awsConfig{}
+	err = yaml.Unmarshal(data, cfg)
+	if err != nil {
+		return err
+	}
+
+	err = validateAWSConfig(cfg)
+	if err != nil {
+		return err
+	}
+
+	client.config = cfg
+	return nil
+}
+
+// CheckIfScalingGroupExists checks if the Auto Scaling group exists
+func (client *AWSClient) CheckIfScalingGroupExists(name string) (bool, error) {
 	_, exists, err := client.getAutoscalingGroup(name)
-	return exists, err
+	return exists, fmt.Errorf("couldn't check if an AutoScaling group exists: %v", err)
 }
 
-// GetPrivateIPsOfInstancesOfAutoscalingGroup returns the list of IP addresses of instanes of the Auto Scaling group
-func (client *AWSClient) GetPrivateIPsOfInstancesOfAutoscalingGroup(name string) ([]string, error) {
+// GetUpstreamsConfig returns the configuration for Upstreams. It returns a map with the Upstream name as key and the AutoScaling group as value
+func (client *AWSClient) GetUpstreamsConfig() []Upstream {
+	var upstreams []Upstream
+	for _, u := range client.config.Upstreams {
+		u := Upstream{
+			Name:         u.Name,
+			Port:         u.Port,
+			ScalingGroup: u.AutoscalingGroup,
+			Kind:         u.Kind,
+		}
+		upstreams = append(upstreams, u)
+	}
+	return upstreams
+}
+
+// GetPrivateIPsForScalingGroup returns the list of IP addresses of instanes of the Auto Scaling group
+func (client *AWSClient) GetPrivateIPsForScalingGroup(name string) ([]string, error) {
 	group, exists, err := client.getAutoscalingGroup(name)
 	if err != nil {
 		return nil, err
 	}
+
 	if !exists {
-		return nil, fmt.Errorf("autoscaling group %v doesn't exists", name)
+		return nil, fmt.Errorf("autoscaling group %v doesn't exist", name)
 	}
 
 	instances, err := client.getInstancesOfAutoscalingGroup(group)
@@ -50,6 +111,16 @@ func (client *AWSClient) GetPrivateIPsOfInstancesOfAutoscalingGroup(name string)
 	}
 
 	return result, nil
+}
+
+// GetSyncIntervalInSeconds returns the SyncIntervalInSeconds config value
+func (client *AWSClient) GetSyncIntervalInSeconds() time.Duration {
+	return client.config.SyncIntervalInSeconds
+}
+
+// GetAPIEndpoint returns the APIEndpoint config value
+func (client *AWSClient) GetAPIEndpoint() string {
+	return client.config.APIEndpoint
 }
 
 func (client *AWSClient) getAutoscalingGroup(name string) (*autoscaling.Group, bool, error) {

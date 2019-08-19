@@ -3,18 +3,16 @@ package main
 import (
 	"fmt"
 	"time"
-
-	"gopkg.in/yaml.v2"
 )
 
-type config struct {
+type awsConfig struct {
 	Region                string
 	APIEndpoint           string        `yaml:"api_endpoint"`
 	SyncIntervalInSeconds time.Duration `yaml:"sync_interval_in_seconds"`
-	Upstreams             []upstream
+	Upstreams             []awsUpstream
 }
 
-type upstream struct {
+type awsUpstream struct {
 	Name             string
 	AutoscalingGroup string `yaml:"autoscaling_group"`
 	Port             int
@@ -28,32 +26,7 @@ const upstreamErrorMsgFormat = "The mandatory field %v is either empty or missin
 const upstreamPortErrorMsgFormat = "The mandatory field port is either zero or missing for the upstream %v in the config file"
 const upstreamKindErrorMsgFormat = "The mandatory field kind is either not equal to http or tcp or missing for the upstream %v in the config file"
 
-func parseConfig(data []byte) (*config, error) {
-	cfg, err := unmarshalConfig(data)
-	if err != nil {
-		return nil, err
-	}
-
-	err = validateConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	return cfg, nil
-}
-
-func unmarshalConfig(data []byte) (*config, error) {
-	cfg := config{}
-
-	err := yaml.Unmarshal(data, &cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	return &cfg, nil
-}
-
-func validateConfig(cfg *config) error {
+func validateAWSConfig(cfg *awsConfig) error {
 	if cfg.Region == "" {
 		return fmt.Errorf(errorMsgFormat, "region")
 	}

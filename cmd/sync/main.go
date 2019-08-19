@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -12,16 +11,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/autoscaling"
-	"github.com/aws/aws-sdk-go/service/ec2"
-
 	nginx "github.com/nginxinc/nginx-plus-go-client/client"
 )
 
 var configFile = flag.String("config_path", "/etc/nginx/aws.yaml", "Path to the config file")
 var logFile = flag.String("log_path", "", "Path to the log file. If the file doesn't exist, it will be created")
+var cloudProvider = flag.String("cloud_provider", "AWS", "CloudProvider selected. Valid values are: 'AWS'")
 var version = "0.2-1"
 
 const connTimeoutInSecs = 10
@@ -38,35 +33,44 @@ func main() {
 		log.SetOutput(io.MultiWriter(logF, os.Stderr))
 	}
 
-	log.Printf("nginx-asg-sync version %s", version)
-
-	data, err := ioutil.ReadFile(*configFile)
-	if err != nil {
-		log.Printf("Couldn't open the config file: %v", err)
+	if *cloudProvider != "" {
+		if !validateCloudProvider(*cloudProvider) {
+			log.Printf("Invalid Cloud Provider %v", *cloudProvider)
+			os.Exit(10)
+		}
+	} else {
+		log.Printf("cloud_provider is required")
 		os.Exit(10)
 	}
 
-	cfg, err := parseConfig(data)
+	log.Printf("nginx-asg-sync version %s", version)
+
+	var cloudProviderClient CloudProvider
+	if *cloudProvider == "AWS" {
+		cloudProviderClient = NewAWSClient()
+	}
+
+	err := cloudProviderClient.ValidateAndSaveConfig(*configFile)
 	if err != nil {
-		log.Printf("Couldn't parse the config file %v: %v", *configFile, err)
+		log.Printf("Couldn't parse or validate the config file %v: %v", *configFile, err)
+		os.Exit(10)
+	}
+
+	err = cloudProviderClient.Configure()
+	if err != nil {
+		log.Printf("Couldn't configure cloud provider client: %v", err)
 		os.Exit(10)
 	}
 
 	httpClient := &http.Client{Timeout: connTimeoutInSecs * time.Second}
-	nginxClient, err := nginx.NewNginxClient(httpClient, cfg.APIEndpoint)
+	nginxClient, err := nginx.NewNginxClient(httpClient, cloudProviderClient.GetAPIEndpoint())
 
 	if err != nil {
 		log.Printf("Couldn't create NGINX client: %v", err)
 		os.Exit(10)
 	}
 
-	awsClient, err := createAWSClient(cfg.Region)
-	if err != nil {
-		log.Printf("Couldn't create AWS client: %v", err)
-		os.Exit(10)
-	}
-
-	for _, ups := range cfg.Upstreams {
+	for _, ups := range cloudProviderClient.GetUpstreamsConfig() {
 		if ups.Kind == "http" {
 			err = nginxClient.CheckIfUpstreamExists(ups.Name)
 		} else {
@@ -77,12 +81,13 @@ func main() {
 			log.Printf("Problem with the NGINX configuration: %v", err)
 			os.Exit(10)
 		}
-		exists, err := awsClient.CheckIfAutoscalingGroupExists(ups.AutoscalingGroup)
+
+		exists, err := cloudProviderClient.CheckIfScalingGroupExists(ups.ScalingGroup)
 		if err != nil {
-			log.Printf("Couldn't check if an Auto Scaling group exists: %v", err)
+			log.Printf("Error with cloud provider configuration: %v", err)
 			os.Exit(10)
 		} else if !exists {
-			log.Printf("Warning: Auto Scaling group %v doesn't exists", ups.AutoscalingGroup)
+			log.Printf("Warning: Scaling group '%v' doesn't exist in the cloud provider", ups.ScalingGroup)
 		}
 	}
 
@@ -90,15 +95,14 @@ func main() {
 	signal.Notify(sigterm, syscall.SIGTERM)
 
 	for {
-		for _, upstream := range cfg.Upstreams {
-			ips, err := awsClient.GetPrivateIPsOfInstancesOfAutoscalingGroup(upstream.AutoscalingGroup)
+		for _, upstream := range cloudProviderClient.GetUpstreamsConfig() {
+			ips, err := cloudProviderClient.GetPrivateIPsForScalingGroup(upstream.ScalingGroup)
 			if err != nil {
-				log.Printf("Couldn't get the IP addresses of instances of the Auto Scaling group %v: %v", upstream.AutoscalingGroup, err)
+				log.Printf("Couldn't get the IP addresses for %v: %v", upstream.ScalingGroup, err)
 				continue
 			}
 
 			if upstream.Kind == "http" {
-
 				var upsServers []nginx.UpstreamServer
 				for _, ip := range ips {
 					backend := fmt.Sprintf("%v:%v", ip, upstream.Port)
@@ -141,24 +145,10 @@ func main() {
 		}
 
 		select {
-		case <-time.After(cfg.SyncIntervalInSeconds * time.Second):
+		case <-time.After(cloudProviderClient.GetSyncIntervalInSeconds() * time.Second):
 		case <-sigterm:
 			log.Println("Terminating...")
 			return
 		}
 	}
-}
-
-func createAWSClient(region string) (*AWSClient, error) {
-	httpClient := &http.Client{Timeout: connTimeoutInSecs * time.Second}
-	cfg := &aws.Config{Region: aws.String(region), HTTPClient: httpClient}
-
-	session, err := session.NewSession(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	svcAutoscaling := autoscaling.New(session)
-	svcEC2 := ec2.New(session)
-	return NewAWSClient(svcEC2, svcAutoscaling), nil
 }
